@@ -1,0 +1,823 @@
+---
+title: "Assignment 1 | Singapore condominium market, Sep 2021-Aug 2026"
+output:
+  word_document:
+    fig_width: 6.8
+    fig_height: 3.2
+params:
+  data_file: "/Users/moguuu/Desktop/Trimester 3/R/Machine Learing/Assignment 1/Condo_5 years_data.xlsx"
+  out_tab: "output/page3/tables"
+  out_fig: "output/page3/figures"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, dpi = 200)
+```
+
+```{r pkgs, include=FALSE}
+# tidyverse: ggplot2 for charts, dplyr for data processing, and tidyr for reshaping (Lecture Notes 3 and 4).
+# readxl: read the Excel source file.
+library(tidyverse)
+library(readxl)
+options(dplyr.summarise.inform = FALSE)
+```
+
+```{r params, include=FALSE}
+# Keep settings used throughout the analysis here so the definitions can be changed in one place.
+DATA_FILE <- params$data_file
+OUT_TAB   <- params$out_tab
+OUT_FIG   <- params$out_fig
+
+dir.create(OUT_TAB, recursive = TRUE, showWarnings = FALSE)
+dir.create(OUT_FIG, recursive = TRUE, showWarnings = FALSE)
+
+# Start and End of the study period; 2026-09 is incomplete and excluded.
+MONTH_MIN <- "2021-09"     
+MONTH_MAX <- "2026-08"     
+PROP_KEEP <- c("Apartment", "Condominium", "Executive Condominium")
+AREA_KEEP <- "Strata"
+
+# Price cells below this threshold are described but not compared
+MIN_N_PRICE  <- 30     
+
+# Convert square meters to square feet
+SQM_TO_SQFT  <- 10.7639104  
+
+# Standard foreign-buyer ABSD from 27 Apr 2023
+ABSD_FOREIGN <- 0.6
+
+# Exact ABSD change dates, used for reference lines in the full report's trend chart.
+POLICY_DATES <- as.Date(c("2021-12-16", "2023-04-27"))
+
+# First and last 12-month windows for the full report's price-change comparison.
+FIRST_YEAR <- c("2021-09", "2022-08")
+LAST_YEAR  <- c("2025-09", "2026-08")
+
+# Display regions in CCR -> RCR -> OCR order rather than alphabetical order.
+SEG_LEVELS  <- c("CCR", "RCR", "OCR")
+SALE_LEVELS <- c("New Sale", "Sub Sale", "Resale")
+TYPE_LEVELS <- c("Apartment", "Condominium", "Executive Condominium")
+
+# Colour-blind-friendly Okabe-Ito palette.
+PAL_SEG  <- c(CCR = "#0072B2", RCR = "#009E73", OCR = "#E69F00")
+PAL_SALE <- c("New Sale" = "#D55E00", "Sub Sale" = "#CC79A7", "Resale" = "#56B4E9")
+```
+
+```{r own-functions, include=FALSE}
+# (1) Policy phases: standard foreign-buyer ABSD rose from 20% to 30% on
+#     16 Dec 2021, then from 30% to 60% on 27 Apr 2023. The data record only
+#     the month, so the two change months cannot be assigned to a phase.
+#     They remain in trend charts but are excluded from phase comparisons.
+make_phase <- function(m) {
+  ifelse(m >= "2021-09" & m <= "2021-11", "P1",
+  ifelse(m >= "2022-01" & m <= "2023-03", "P2",
+  ifelse(m >= "2023-05" & m <= "2026-08", "P3", NA)))
+}
+PHASE_LABEL <- c(P1 = "Sep-Nov 2021 (ABSD 20%)",
+                 P2 = "Jan 2022-Mar 2023 (ABSD 30%)",
+                 P3 = "May 2023-Aug 2026 (ABSD 60%)")
+
+# (2) Tenure categories. Very long leases, such as 999-year leases, are kept
+#     separate from freehold even though they are economically similar.
+make_tenure_group <- function(freehold, lease) {
+  ifelse(freehold, "Freehold",
+  ifelse(!is.na(lease) & lease >= 900, "Long lease (>=900y)",
+  ifelse(!is.na(lease), "Leasehold", "Unknown")))
+}
+
+# (3) Remaining-lease bands, in years.
+make_lease_group <- function(x) {
+  ifelse(is.na(x), NA,
+  ifelse(x < 60, "<60",
+  ifelse(x < 80, "60-79",
+  ifelse(x < 95, "80-94", ">=95"))))
+}
+
+# (4) Restore floor ranges. Excel may convert "01-05", "06-10", and "11-15"
+#     into dates. Both formatted dates and Excel serial numbers are mapped
+#     back to their unique floor ranges. Original CSV values are unaffected.
+fix_floor <- function(x) {
+  x <- substr(trimws(as.character(x)), 1, 10)
+  ifelse(x == "2026-05-01" | x == "46143", "01-05",
+  ifelse(x == "2026-10-06" | x == "46301", "06-10",
+  ifelse(x == "2015-11-01" | x == "42309", "11-15", x)))
+}
+# List all the converted floor data
+FLOOR_DATE_CODES <- c("46143", "46301", "42309",
+                      "2026-05-01", "2026-10-06", "2015-11-01")
+
+# (5) Combine floors into four bands; bands above floor 15 are too sparse
+#     to analyse separately.
+FLOOR_OK <- c("B1-B5", "01-05", "06-10", "11-15", "16-20", "21-25", "26-30",
+              "31-35", "36-40", "41-45", "46-50", "51-55", "56-60",
+              "61-65", "66-70", "71-75", "76-80")
+make_floor_band <- function(f) {
+  ifelse(!(f %in% FLOOR_OK), NA,
+  ifelse(f == "B1-B5" | f == "01-05", "B1-05",
+  ifelse(f == "06-10", "06-10",
+  ifelse(f == "11-15", "11-15", "16+"))))
+}
+
+# (6) Reconstruct the month from contract_date_raw (MMYY) to check
+#     contract_month. Restore any leading zero removed by Excel (0921 -> 921).
+month_from_raw <- function(raw) {
+  x <- suppressWarnings(as.integer(raw))
+  s <- sprintf("%04d", x)
+  ifelse(is.na(x), NA, paste0("20", substr(s, 3, 4), "-", substr(s, 1, 2)))
+}
+
+# (7) Return the first value meeting a condition, or NA if none exists.
+ref <- function(v, cond) {
+  r <- v[which(cond)]
+  if (length(r) == 0) NA_real_ else r[1]
+}
+
+# (8) Table number formatting: show missing values as n/a, never as zero.
+#     Generated text uses ASCII characters to avoid locale-specific rendering issues.
+fmt_n   <- function(x) ifelse(is.na(x), "n/a",
+             formatC(round(x), format = "f", digits = 0, big.mark = ","))
+fmt_m   <- function(x, d = 2) ifelse(is.na(x), "n/a",
+             formatC(x / 1e6, format = "f", digits = d))
+fmt_p   <- function(x, d = 1) ifelse(is.na(x), "n/a",
+             formatC(x, format = "f", digits = d))
+fmt_chg <- function(x, d = 0) {
+  r <- round(x, d) + 0                     # Adding zero removes negative zero.
+  ifelse(is.na(r), "n/a",
+         paste0(ifelse(r > 0, "+", ""), formatC(r, format = "f", digits = d), "%"))
+}
+fmt_rng <- function(lo, hi) ifelse(is.na(lo), "n/a", paste0(fmt_m(lo), "-", fmt_m(hi)))
+
+# Mark small-sample cells with an asterisk, explained in the table note.
+fmt_small <- function(txt, n) ifelse(is.na(n) | n < MIN_N_PRICE, paste0(txt, "\\*"), txt)
+
+# (9) Table output: left-align the first n_left columns and right-align the rest.
+#     Escape the dollar sign in "S$" so Word does not interpret it as math.
+#     Set pipe-table widths using the longest values and header words so
+#     numbers do not wrap across multiple lines in Word.
+esc_dollar <- function(x) gsub("$", "\\$", x, fixed = TRUE)
+show_tbl <- function(df, caption, n_left = 1) {
+  df <- as.data.frame(df)
+  for (j in seq_along(df)) df[[j]] <- esc_dollar(as.character(df[[j]]))
+  names(df) <- esc_dollar(names(df))
+  align <- c(rep("l", n_left), rep("r", ncol(df) - n_left))
+  tb <- knitr::kable(df, format = "pipe", caption = esc_dollar(caption), align = align)
+  width <- sapply(seq_along(df), function(j) {
+    head_word <- max(nchar(strsplit(names(df)[j], " ")[[1]]))
+    value_len <- min(max(nchar(df[[j]]), na.rm = TRUE), 18)   # Long text columns may wrap.
+    max(value_len, ceiling(1.15 * head_word)) + 5           # Keep header words intact, with padding.
+  })
+  seps <- ifelse(align == "l", paste0(":", strrep("-", width - 1)),
+                               paste0(strrep("-", width - 1), ":"))
+  i <- grep("^\\|[-:|]+\\|$", tb)[1]
+  tb[i] <- paste0("|", paste(seps, collapse = "|"), "|")
+  tb
+}
+save_tbl <- function(df, name) {
+  # write_excel_csv includes a BOM for reliable opening in Excel.
+  readr::write_excel_csv(df, file.path(OUT_TAB, paste0(name, ".csv")))
+}
+```
+
+```{r read-filter, include=FALSE}
+# Read all columns as text so R or Excel does not reinterpret floor or date codes.
+read_ura <- function(path) {
+  if (tolower(tools::file_ext(path)) == "csv") {
+    read_csv(path, col_types = cols(.default = col_character()),
+             na = c("", "NA"))
+  } else {
+    read_excel(path, sheet = 1, col_types = "text")
+  }
+}
+raw <- read_ura(DATA_FILE) %>% mutate(across(everything(), trimws))
+
+need <- c("project", "market_segment", "contract_month", "contract_date_raw",
+          "property_type", "type_of_area", "tenure", "is_freehold",
+          "lease_years", "approx_remaining_lease_years", "floor_range",
+          "type_of_sale", "no_of_units", "price_sgd", "nett_price_sgd",
+          "area_sqm", "price_per_sqft")
+miss <- setdiff(need, names(raw))
+if (length(miss) > 0) stop("Missing columns in the data: ", paste(miss, collapse = ", "))
+
+# Convert numeric fields back to numbers using a loop (Lecture Note 2).
+num_cols <- c("no_of_units", "price_sgd", "nett_price_sgd", "area_sqm",
+              "price_per_sqm", "price_per_sqft", "district",
+              "lease_years", "lease_start_year", "approx_remaining_lease_years")
+for (v in intersect(num_cols, names(raw))) {
+  raw[[v]] <- suppressWarnings(as.numeric(raw[[v]]))
+}
+
+# Check that contract_month uses YYYY-MM; reconstruct invalid values from contract_date_raw.
+raw <- raw %>%
+  mutate(month_raw = month_from_raw(contract_date_raw),
+         month_ok  = !is.na(contract_month) &
+                     grepl("^[0-9]{4}-[0-9]{2}$", contract_month))
+n_month_bad      <- sum(!raw$month_ok)
+n_month_mismatch <- sum(raw$month_ok & !is.na(raw$month_raw) &
+                        raw$contract_month != raw$month_raw)
+raw <- raw %>% mutate(contract_month = ifelse(month_ok, contract_month, month_raw))
+
+n_raw <- nrow(raw)
+
+# Narrow the sample step by step and record exclusions for the quality log.
+n_after_max  <- sum(raw$contract_month > MONTH_MAX, na.rm = TRUE)
+n_before_min <- sum(raw$contract_month < MONTH_MIN, na.rm = TRUE)
+dat <- raw %>%
+  filter(!is.na(contract_month),
+         contract_month >= MONTH_MIN, contract_month <= MONTH_MAX)
+
+n_other_type <- sum(!(dat$property_type %in% PROP_KEEP))
+dat <- dat %>% filter(property_type %in% PROP_KEEP)
+
+n_nonstrata <- sum(is.na(dat$type_of_area) | dat$type_of_area != AREA_KEEP)
+dat <- dat %>% filter(type_of_area == AREA_KEEP)
+```
+
+```{r derive, include=FALSE}
+# price_base is the key eligibility flag for price statistics:
+#   use only single-unit records with valid price and area for unit price and size;
+#   count all valid transactions in volume using no_of_units.
+dat <- dat %>%
+  mutate(
+    month_date    = as.Date(paste0(contract_month, "-01")),
+    month_idx     = (as.integer(substr(contract_month, 1, 4)) - 2021) * 12 +
+                    as.integer(substr(contract_month, 6, 7)) - 9,
+    phase         = make_phase(contract_month),
+    area_sqft     = area_sqm * SQM_TO_SQFT,
+    price_base    = coalesce(no_of_units == 1 & price_sgd > 0 & area_sqft > 0 &
+                             !is.na(price_per_sqft), FALSE),
+    freehold_flag = toupper(is_freehold) %in% c("TRUE", "T", "1", "YES") |
+                    grepl("^freehold", tenure, ignore.case = TRUE),
+    tenure_group  = make_tenure_group(freehold_flag, lease_years),
+    fh_like       = tenure_group %in% c("Freehold", "Long lease (>=900y)"),
+    # Remaining lease applies only to ordinary leasehold; use NA otherwise, never zero.
+    remaining_lease = ifelse(tenure_group == "Leasehold",
+                             approx_remaining_lease_years, NA),
+    lease_group   = make_lease_group(remaining_lease),
+    floor_fixed   = fix_floor(floor_range),
+    floor_band    = make_floor_band(floor_fixed)
+  )
+
+# Three-month periods: Sep 2021 through Aug 2026 gives 20 complete periods.
+PERIOD_STARTS    <- seq(as.Date("2021-09-01"), by = "3 months", length.out = 20)
+dat$period_start <- PERIOD_STARTS[dat$month_idx %/% 3 + 1]
+
+# Use factors to fix the display order of groups (Lecture Note 2).
+dat <- dat %>%
+  mutate(market_segment = factor(market_segment, levels = SEG_LEVELS),
+         type_of_sale   = factor(type_of_sale,   levels = SALE_LEVELS),
+         property_type  = factor(property_type,  levels = TYPE_LEVELS),
+         lease_group    = factor(lease_group, levels = c("<60", "60-79", "80-94", ">=95")),
+         floor_band     = factor(floor_band,  levels = c("B1-05", "06-10", "11-15", "16+")))
+
+total_units <- sum(dat$no_of_units, na.rm = TRUE)
+```
+
+```{r stat-table, include=FALSE}
+# Input may be grouped or ungrouped; the result is always ungrouped.
+# Volume sums no_of_units across all valid transactions.
+# Price, psf and area use only records with price_base == TRUE (Lecture Note 1).
+stat_table <- function(d) {
+  d %>%
+    summarize(
+      n_txn        = n(),
+      n_units      = sum(no_of_units, na.rm = TRUE),
+      n_price      = sum(price_base),
+      bulk_units   = sum(no_of_units[no_of_units > 1], na.rm = TRUE),
+      price_median = median(price_sgd[price_base]),
+      price_mean   = mean(price_sgd[price_base]),
+      price_p25    = as.numeric(quantile(price_sgd[price_base], 0.25, na.rm = TRUE)),
+      price_p75    = as.numeric(quantile(price_sgd[price_base], 0.75, na.rm = TRUE)),
+      psf_median   = median(price_per_sqft[price_base]),
+      psf_mean     = mean(price_per_sqft[price_base]),
+      psf_p25      = as.numeric(quantile(price_per_sqft[price_base], 0.25, na.rm = TRUE)),
+      psf_p75      = as.numeric(quantile(price_per_sqft[price_base], 0.75, na.rm = TRUE)),
+      area_median  = median(area_sqft[price_base]),
+      fh_share     = 100 * sum(no_of_units[fh_like], na.rm = TRUE) /
+                           sum(no_of_units, na.rm = TRUE),
+      lease_median = median(remaining_lease[price_base], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(flag_small = n_price < MIN_N_PRICE)
+}
+
+# For unit shares, the denominator is all units in the current table; state this in its note.
+add_share <- function(tbl) {
+  tbl %>% mutate(share_units = n_units / sum(n_units),
+                 share_pct   = 100 * share_units)
+}
+```
+
+```{r plot-theme, include=FALSE}
+# Chart text uses English and numeric month labels (%Y-%m) for consistent rendering.
+theme_report <- theme_bw(base_size = 10) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title       = element_text(face = "bold", size = 11),
+        plot.caption     = element_text(colour = "grey35", hjust = 0, size = 7.5),
+        legend.position  = "bottom",
+        strip.background = element_rect(fill = "grey95"),
+        strip.text       = element_text(face = "bold", hjust = 0))
+
+save_fig <- function(p, name, w = 6.8, h = 3.6) {
+  ggsave(file.path(OUT_FIG, paste0(name, ".png")), p, width = w, height = h, dpi = 300)
+  p
+}
+```
+
+```{r table-helpers, include=FALSE}
+# Unit shares of each level in `levels`, as "a / b / c". The denominator is
+# all units in the current group, including multi-unit transactions.
+share_str <- function(units, groups, levels, d = 1) {
+  total <- sum(units, na.rm = TRUE)
+  s <- sapply(levels, function(l) 100 * sum(units[groups == l], na.rm = TRUE) / total)
+  paste(fmt_p(s, d), collapse = " / ")
+}
+
+# "x / y" for paired new-sale and resale values.
+pair_str <- function(a, b) paste0(a, " / ", b)
+
+# Sentence-case sale-type labels for table rows ("New Sale" -> "New sale").
+sale_label <- function(x) sub(" Sale$", " sale", as.character(x))
+```
+
+# Table A1: Data checks and treatment
+
+```{r table-a1}
+# Counts refer to the sample at each step of read-filter
+# (study window -> three property types -> strata), as reported in Table A1.
+# Month labels use month.abb so they stay in English under any system locale.
+mon_lab <- function(m) paste(month.abb[as.integer(substr(m, 6, 7))], substr(m, 1, 4))
+
+# psf consistency: supplied price_per_sqft vs price / area.
+psf_gap   <- abs(dat$price_sgd / dat$area_sqft / dat$price_per_sqft - 1)
+n_psf_bad <- sum(psf_gap > 0.01, na.rm = TRUE)
+
+# Records covering more than one unit (mostly collective sales).
+bulk_sales <- dat %>% filter(no_of_units > 1)
+
+# Floor ranges that Excel stored as dates or date serial numbers.
+n_floor_date <- sum(substr(dat$floor_range, 1, 10) %in% FLOOR_DATE_CODES)
+pct_floor    <- round(100 * mean(!is.na(dat$floor_band)), 1)
+
+# Remaining lease below 20 or above 99 years, and leaseholds without it.
+lease_odd <- dat %>%
+  filter(tenure_group == "Leasehold", !is.na(remaining_lease),
+         remaining_lease < 20 | remaining_lease > 99)
+n_lease_missing <- sum(dat$tenure_group == "Leasehold" & is.na(dat$remaining_lease))
+
+n_nett_missing <- sum(is.na(dat$nett_price_sgd))
+
+# Sample window: months after MONTH_MAX are named rather than hard-coded.
+months_after <- sort(unique(raw$contract_month[!is.na(raw$contract_month) &
+                                               raw$contract_month > MONTH_MAX]))
+window_txt <- paste0(mon_lab(MONTH_MIN), " - ", mon_lab(MONTH_MAX), " (",
+                     n_distinct(dat$contract_month), " months)")
+if (n_after_max > 0) {
+  window_txt <- paste0(window_txt, "; ", fmt_n(n_after_max), " records from ",
+                       paste(mon_lab(months_after), collapse = ", "))
+}
+if (n_before_min > 0) {
+  window_txt <- paste0(window_txt, "; ", fmt_n(n_before_min), " records before ",
+                       mon_lab(MONTH_MIN))
+}
+
+tabA1 <- data.frame(
+  Check = c("Sample window",
+            "Other property types",
+            "Non-strata records",
+            "Multi-unit records",
+            "Floor range stored as dates",
+            "Net price",
+            "psf consistency",
+            "Remaining lease"),
+  Result = c(window_txt,
+             paste0(fmt_n(n_other_type), " records"),
+             paste0(fmt_n(n_nonstrata), " records"),
+             paste0(fmt_n(nrow(bulk_sales)), " records / ",
+                    fmt_n(sum(bulk_sales$no_of_units)), " units"),
+             paste0(fmt_n(n_floor_date), " values converted; ", pct_floor, "% usable"),
+             paste0(fmt_n(n_nett_missing), " of ", fmt_n(nrow(dat)), " records blank"),
+             paste0(fmt_n(n_psf_bad), " records differ from price / area by more than 1%"),
+             paste0(fmt_n(nrow(lease_odd)), " records below 20 or above 99 years; ",
+                    fmt_n(n_lease_missing), " without a lease start year")),
+  Treatment = c("Sep 2026 is incomplete and excluded",
+                "Excluded (outside the non-landed scope)",
+                "Excluded",
+                "Counted in volume; excluded from price, psf and size",
+                "Mapped back to floor bands (e.g. 46143 = 01-05)",
+                "Not used in the analysis",
+                "Supplied psf used",
+                "Not used in the analysis")
+)
+save_tbl(tabA1, "tA1_data_checks")
+show_tbl(tabA1, "Table A1. Data checks and treatment")
+```
+
+# Table 1: Transaction summary by market segment
+
+```{r table-1}
+t1_all <- dat %>%
+  summarize(type_mix = share_str(no_of_units, property_type, TYPE_LEVELS),
+            sale_mix = share_str(no_of_units, type_of_sale,  SALE_LEVELS)) %>%
+  bind_cols(dat %>% stat_table()) %>%
+  mutate(segment = "All transactions")
+
+t1_seg <- dat %>%
+  group_by(market_segment) %>%
+  summarize(type_mix = share_str(no_of_units, property_type, TYPE_LEVELS),
+            sale_mix = share_str(no_of_units, type_of_sale,  SALE_LEVELS),
+            .groups = "drop") %>%
+  left_join(dat %>% group_by(market_segment) %>% stat_table(),
+            by = "market_segment") %>%
+  mutate(segment = as.character(market_segment)) %>%
+  select(-market_segment)
+
+tab1 <- bind_rows(t1_all, t1_seg) %>% relocate(segment)
+stopifnot(tab1$n_units[1] == sum(tab1$n_units[-1]))
+save_tbl(tab1, "t1_market_segment")
+
+tab1 %>%
+  transmute(`Market segment` = segment,
+            Units = fmt_n(n_units),
+            `Apartment / Condo / EC (%)` = type_mix,
+            `New / Sub / Resale (%)` = sale_mix,
+            `Median price (S$ m)` = fmt_m(price_median),
+            `Median psf (S$)` = fmt_n(psf_median),
+            `Median size (sq ft)` = fmt_n(area_median)) %>%
+  show_tbl("Table 1. Transaction summary by market segment")
+```
+
+Note: Both sets of percentages are shares of units in each row, including
+multi-unit transactions. Medians use single-unit transactions with valid prices
+and areas. S$ m = millions of Singapore dollars.
+
+# Table A2: Transaction summary by property type and sale type
+
+```{r table-a2}
+tabA2 <- bind_rows(
+  dat %>% stat_table() %>% mutate(group = "All transactions"),
+  dat %>% group_by(property_type) %>% stat_table() %>%
+    mutate(group = as.character(property_type)) %>% select(-property_type),
+  dat %>% group_by(type_of_sale) %>% stat_table() %>%
+    mutate(group = sale_label(type_of_sale)) %>% select(-type_of_sale)
+) %>% relocate(group)
+save_tbl(tabA2, "tA2_property_and_sale_type")
+
+tabA2 %>%
+  transmute(Group = group,
+            Units = fmt_n(n_units),
+            `Median price (S$ m)` = fmt_m(price_median),
+            `Median psf (S$)` = fmt_n(psf_median),
+            `Median size (sq ft)` = fmt_n(area_median)) %>%
+  show_tbl("Table A2. Transaction summary by property type and sale type")
+```
+
+Note: Units include multi-unit transactions; prices and sizes use single-unit
+transactions. S$ m = millions of Singapore dollars.
+
+# Figure 1: Monthly prices and volumes by sale type
+
+```{r figure-1, fig.height=5.4}
+# Prices and volumes in one figure with two stacked panels (facet).
+# Prices show new sale and resale only; sub sales are too few for a monthly median.
+# No title or caption: these are added in LaTeX.
+PANEL_PSF <- "Median price (S$ per sq ft), single-unit transactions"
+PANEL_VOL <- "Units transacted per month"
+panels    <- c(PANEL_PSF, PANEL_VOL)
+
+trend_psf <- dat %>%
+  filter(type_of_sale != "Sub Sale") %>%
+  group_by(month_date, type_of_sale) %>%
+  stat_table() %>%
+  mutate(value = ifelse(flag_small, NA, psf_median),
+         panel = factor(PANEL_PSF, levels = panels))
+
+trend_vol <- dat %>%
+  group_by(month_date, type_of_sale) %>%
+  summarize(value = sum(no_of_units, na.rm = TRUE), .groups = "drop") %>%
+  mutate(panel = factor(PANEL_VOL, levels = panels))
+
+save_tbl(trend_psf, "f1_data_monthly_psf")
+save_tbl(trend_vol, "f1_data_monthly_units")
+
+policy_lab <- data.frame(x = POLICY_DATES,
+                         label = c("ABSD 30%", "ABSD 60%"),
+                         panel = factor(PANEL_PSF, levels = panels))
+
+f1 <- ggplot() +
+  geom_col(data = trend_vol, aes(x = month_date, y = value, fill = type_of_sale),
+           width = 26) +
+  geom_line(data = trend_psf, aes(x = month_date, y = value, colour = type_of_sale),
+            linewidth = 0.7, na.rm = TRUE) +
+  geom_point(data = trend_psf, aes(x = month_date, y = value, colour = type_of_sale),
+             size = 0.9, na.rm = TRUE) +
+  geom_vline(xintercept = POLICY_DATES, linetype = "dashed", colour = "grey40") +
+  geom_text(data = policy_lab, aes(x = x, y = Inf, label = label),
+            hjust = -0.08, vjust = 1.4, size = 2.8, colour = "grey30") +
+  facet_wrap(~ panel, ncol = 1, scales = "free_y") +
+  scale_fill_manual(values = PAL_SALE, name = NULL) +
+  scale_colour_manual(values = PAL_SALE, guide = "none") +
+  scale_x_date(date_breaks = "6 months", date_labels = "%Y-%m",
+               expand = expansion(mult = 0.01)) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = "Contract month", y = NULL) +
+  theme_report
+save_fig(f1, "f1_trend_by_sale_type", h = 5.4)
+```
+
+Note: Lines represent monthly median psf (months with fewer than
+`r MIN_N_PRICE` single-unit transactions are left blank) and bars represent
+units transacted monthly. Dashed lines mark the ABSD rate increases on
+16 December 2021 and 27 April 2023.
+
+# Table 2: Market conditions under the three ABSD rates
+
+```{r table-2}
+# December 2021 and April 2023 have phase = NA (see make_phase) and drop out here.
+T2_LABEL <- c(P1 = "ABSD 20% (Sep 2021-Nov 2021)",
+              P2 = "ABSD 30% (Jan 2022-Mar 2023)",
+              P3 = "ABSD 60% (May 2023-Aug 2026)")
+ph <- dat %>% filter(!is.na(phase))
+
+t2_volume <- ph %>%
+  group_by(phase) %>%
+  summarize(months    = n_distinct(contract_month),
+            n_units   = sum(no_of_units, na.rm = TRUE),
+            new_share = 100 * sum(no_of_units[type_of_sale == "New Sale"], na.rm = TRUE) / n_units,
+            res_share = 100 * sum(no_of_units[type_of_sale == "Resale"],   na.rm = TRUE) / n_units,
+            .groups = "drop") %>%
+  mutate(units_pm = n_units / months)
+
+# "All" medians pool all three sale types, as in Table 1.
+t2_all <- ph %>% group_by(phase) %>% stat_table() %>%
+  select(phase, psf_all = psf_median, area_all = area_median)
+
+t2_pairs <- ph %>%
+  filter(type_of_sale %in% c("New Sale", "Resale")) %>%
+  group_by(phase, type_of_sale) %>%
+  stat_table() %>%
+  group_by(phase) %>%
+  summarize(psf_new  = ref(psf_median,  type_of_sale == "New Sale"),
+            psf_res  = ref(psf_median,  type_of_sale == "Resale"),
+            area_new = ref(area_median, type_of_sale == "New Sale"),
+            area_res = ref(area_median, type_of_sale == "Resale"),
+            .groups = "drop")
+
+tab2 <- t2_volume %>%
+  left_join(t2_all,   by = "phase") %>%
+  left_join(t2_pairs, by = "phase")
+stopifnot(identical(tab2$months, c(3L, 15L, 40L)))
+save_tbl(tab2, "t2_absd_phases")
+
+tab2 %>%
+  transmute(Period = T2_LABEL[phase],
+            `Months in period` = fmt_n(months),
+            `Units transacted per month` = fmt_n(units_pm),
+            `Share of units (%) New / Resale` = pair_str(fmt_p(new_share), fmt_p(res_share)),
+            `Median psf (S$)` = fmt_n(psf_all),
+            `Median psf (S$) New / Resale` = pair_str(fmt_n(psf_new), fmt_n(psf_res)),
+            `Median size (sq ft)` = fmt_n(area_all),
+            `Median size (sq ft) New / Resale` = pair_str(fmt_n(area_new), fmt_n(area_res))) %>%
+  show_tbl("Table 2. Market conditions under the three ABSD rates")
+```
+
+Note: The shares of new sale and resale do not sum to 100% because sub sale is
+omitted. December 2021 and April 2023 are excluded because monthly data cannot
+separate transactions before and after each policy change.
+
+# Table 3: Condominiums by market segment - new sale vs resale
+
+```{r table-3}
+condo <- dat %>% filter(property_type == "Condominium")
+condo_bulk <- sum(condo$no_of_units[condo$no_of_units > 1], na.rm = TRUE)
+
+# Units and new-sale share use all sale types, including Sub Sale.
+t3_units <- condo %>%
+  group_by(market_segment) %>%
+  summarize(n_units   = sum(no_of_units, na.rm = TRUE),
+            new_share = 100 *
+              sum(no_of_units[type_of_sale == "New Sale"], na.rm = TRUE) / n_units,
+            .groups = "drop")
+
+t3_pairs <- condo %>%
+  filter(type_of_sale %in% c("New Sale", "Resale")) %>%
+  group_by(market_segment, type_of_sale) %>%
+  stat_table() %>%
+  group_by(market_segment) %>%
+  summarize(psf_new   = ref(psf_median,   type_of_sale == "New Sale"),
+            psf_res   = ref(psf_median,   type_of_sale == "Resale"),
+            p25_new   = ref(psf_p25,      type_of_sale == "New Sale"),
+            p75_new   = ref(psf_p75,      type_of_sale == "New Sale"),
+            p25_res   = ref(psf_p25,      type_of_sale == "Resale"),
+            p75_res   = ref(psf_p75,      type_of_sale == "Resale"),
+            area_new  = ref(area_median,  type_of_sale == "New Sale"),
+            area_res  = ref(area_median,  type_of_sale == "Resale"),
+            price_new = ref(price_median, type_of_sale == "New Sale"),
+            price_res = ref(price_median, type_of_sale == "Resale"),
+            n_new     = ref(n_price,      type_of_sale == "New Sale"),
+            n_res     = ref(n_price,      type_of_sale == "Resale"),
+            .groups = "drop")
+
+tab3 <- t3_units %>% left_join(t3_pairs, by = "market_segment")
+save_tbl(tab3, "t3_condo_by_segment")
+
+tab3 %>%
+  transmute(`Market segment` = as.character(market_segment),
+            Units = fmt_n(n_units),
+            `New-sale share (%)` = fmt_p(new_share),
+            `Median psf (S$) New / Resale` =
+              pair_str(fmt_small(fmt_n(psf_new), n_new), fmt_small(fmt_n(psf_res), n_res)),
+            `Middle 50% psf (S$) New / Resale` =
+              pair_str(paste0(fmt_n(p25_new), "-", fmt_n(p75_new)),
+                       paste0(fmt_n(p25_res), "-", fmt_n(p75_res))),
+            `Median size (sq ft) New / Resale` = pair_str(fmt_n(area_new), fmt_n(area_res)),
+            `Median price (S$ m) New / Resale` = pair_str(fmt_m(price_new), fmt_m(price_res))) %>%
+  show_tbl("Table 3. Condominiums by market segment: new sale vs resale")
+```
+
+Note: Units and new-sale share include all three sale types, including
+`r fmt_n(condo_bulk)` resale units sold in collective transactions, which are
+excluded from prices and sizes. Middle 50% = 25th to 75th percentile of psf.
+`*` denotes fewer than 30 single-unit price observations.
+
+# Figure 2: Median psf by market segment - resale condominiums
+
+```{r figure-2, fig.height=3.8}
+# Resale condominiums only; each point is the median of a 3-month block,
+# drawn at the middle of the block. No title or caption: added in LaTeX.
+rc <- dat %>% filter(property_type == "Condominium", type_of_sale == "Resale")
+
+reg_trend <- rc %>%
+  group_by(period_start, market_segment) %>%
+  stat_table() %>%
+  mutate(value = ifelse(flag_small, NA, psf_median),
+         x     = period_start + 45)
+save_tbl(reg_trend, "f2_data_region_trend")
+
+f2 <- ggplot(reg_trend, aes(x = x, y = value, colour = market_segment)) +
+  geom_vline(xintercept = POLICY_DATES, linetype = "dashed", colour = "grey40") +
+  geom_line(linewidth = 0.8, na.rm = TRUE) +
+  geom_point(size = 1.3, na.rm = TRUE) +
+  scale_colour_manual(values = PAL_SEG, name = NULL) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%Y-%m") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = "Contract period (3-month blocks, Sep 2021 - Aug 2026)",
+       y = "S$ per sq ft") +
+  theme_report
+save_fig(f2, "f2_region_trend_resale_condo", h = 3.8)
+```
+
+Note: Lines represent the median psf of resale condominiums in each 3-month
+block. Dashed lines mark the ABSD rate increases on 16 December 2021 and
+27 April 2023.
+
+# Table 4: OCR property types - new sale vs resale
+
+```{r table-4}
+ocr <- dat %>% filter(market_segment == "OCR")
+
+# Units and new-sale share use all sale types, including Sub Sale.
+ocr_units <- ocr %>%
+  group_by(property_type) %>%
+  summarize(n_units   = sum(no_of_units, na.rm = TRUE),
+            new_share = 100 *
+              sum(no_of_units[type_of_sale == "New Sale"], na.rm = TRUE) / n_units,
+            .groups = "drop")
+
+# Paired medians compare New Sale with Resale within each property type.
+ocr_pairs <- ocr %>%
+  filter(type_of_sale %in% c("New Sale", "Resale")) %>%
+  group_by(property_type, type_of_sale) %>%
+  stat_table() %>%
+  group_by(property_type) %>%
+  summarize(psf_new   = ref(psf_median,   type_of_sale == "New Sale"),
+            psf_res   = ref(psf_median,   type_of_sale == "Resale"),
+            area_new  = ref(area_median,  type_of_sale == "New Sale"),
+            area_res  = ref(area_median,  type_of_sale == "Resale"),
+            price_new = ref(price_median, type_of_sale == "New Sale"),
+            price_res = ref(price_median, type_of_sale == "Resale"),
+            n_new     = ref(n_price,      type_of_sale == "New Sale"),
+            n_res     = ref(n_price,      type_of_sale == "Resale"),
+            .groups = "drop") %>%
+  mutate(premium = 100 * (psf_new / psf_res - 1))   # before rounding
+
+tab4 <- ocr_units %>% left_join(ocr_pairs, by = "property_type")
+save_tbl(tab4, "t4_ocr_property_new_vs_resale")
+
+tab4 %>%
+  transmute(`Property type` = as.character(property_type),
+            `Total units` = fmt_n(n_units),
+            `New-sale share (%)` = fmt_p(new_share, 0),
+            `Median psf (S$) New / Resale` =
+              paste0(fmt_small(fmt_n(psf_new), n_new), " / ",
+                     fmt_small(fmt_n(psf_res), n_res)),
+            `New-sale premium (%)` = sub("%", "", fmt_chg(premium), fixed = TRUE),
+            `Median size (sq ft) New / Resale` =
+              paste0(fmt_n(area_new), " / ", fmt_n(area_res)),
+            `Median price (S$ m) New / Resale` =
+              paste0(fmt_m(price_new), " / ", fmt_m(price_res))) %>%
+  show_tbl("Table 4. OCR property types: new sale vs resale")
+```
+
+Note: Total units and new-sale share include all three sale types. Medians use
+single-unit transactions with valid prices and areas. New-sale premium =
+(new-sale median psf / resale median psf - 1) x 100, calculated before rounding.
+`*` denotes fewer than 30 single-unit price observations.
+
+```{r floor-helpers, include=FALSE}
+# Floor-band comparison for any set of OCR property types.
+# Medians use price_base records only (single-unit, valid price and area),
+# through stat_table(). Floor shares use units within each type and sale type.
+floor_compare <- function(types) {
+  sub <- dat %>%
+    filter(market_segment == "OCR", property_type %in% types,
+           type_of_sale %in% c("New Sale", "Resale"), !is.na(floor_band)) %>%
+    mutate(property_type = droplevels(property_type),
+           type_of_sale  = droplevels(type_of_sale))
+  psf <- sub %>%
+    group_by(property_type, floor_band, type_of_sale) %>%
+    stat_table()
+  mix <- sub %>%
+    group_by(property_type, type_of_sale, floor_band) %>%
+    summarize(n_units = sum(no_of_units, na.rm = TRUE), .groups = "drop") %>%
+    group_by(property_type, type_of_sale) %>%
+    mutate(share_pct = 100 * n_units / sum(n_units)) %>%
+    ungroup()
+  gap <- psf %>%
+    group_by(property_type, floor_band) %>%
+    summarize(new    = ref(psf_median, type_of_sale == "New Sale"),
+              resale = ref(psf_median, type_of_sale == "Resale"),
+              n_new  = ref(n_price,    type_of_sale == "New Sale"),
+              n_res  = ref(n_price,    type_of_sale == "Resale"),
+              small  = any(flag_small), .groups = "drop") %>%
+    mutate(gap = new - resale) %>%
+    left_join(mix %>% filter(type_of_sale == "New Sale") %>%
+                select(property_type, floor_band, new_share = share_pct),
+              by = c("property_type", "floor_band")) %>%
+    left_join(mix %>% filter(type_of_sale == "Resale") %>%
+                select(property_type, floor_band, resale_share = share_pct),
+              by = c("property_type", "floor_band"))
+  list(psf = psf, gap = gap)
+}
+
+# Dumbbell chart in the style of Figure 3. No title: captions are added in LaTeX.
+# Several property types are shown as panels sharing one x-axis;
+# ncol = 2 puts two panels side by side.
+plot_floor <- function(fc, ncol = 1) {
+  gap_ok <- fc$gap %>% filter(!is.na(gap))
+  p <- ggplot(fc$psf, aes(x = psf_median, y = floor_band)) +
+    geom_segment(data = gap_ok,
+                 aes(x = resale, xend = new, y = floor_band, yend = floor_band),
+                 inherit.aes = FALSE, colour = "grey75", linewidth = 2) +
+    geom_point(aes(colour = type_of_sale), size = 3) +
+    geom_text(data = gap_ok,
+              aes(x = (new + resale) / 2, y = floor_band,
+                  label = paste0(ifelse(gap >= 0, "+S$", "-S$"),
+                                 scales::comma(abs(round(gap))))),
+              inherit.aes = FALSE, vjust = -0.9, size = 2.9) +
+    scale_colour_manual(values = PAL_SALE, name = NULL) +
+    scale_x_continuous(labels = scales::comma) +
+    labs(x = "Median price (S$ per sq ft)", y = "Floor band") +
+    theme_report
+  if (n_distinct(fc$psf$property_type) > 1) {
+    p <- p + facet_wrap(~ property_type, ncol = ncol)
+  }
+  p
+}
+```
+
+# Figure 3: OCR condominiums - new sale vs resale by floor band
+
+```{r figure-3, fig.height=3.2}
+fc3 <- floor_compare("Condominium")
+save_tbl(fc3$gap, "t6_floor_check_condo")
+f3 <- plot_floor(fc3)
+ggsave(file.path(OUT_FIG, "f3_floor_check.png"), f3,
+       width = 6.8, height = 3.2, dpi = 300)
+f3
+```
+
+Note: OCR condominiums with known floor bands. Labels show the new-sale minus
+resale median psf within each floor band.
+
+# Figure 4: OCR apartments and ECs - new sale vs resale by floor band
+
+```{r figure-4, fig.height=3.4}
+fc4 <- floor_compare(c("Apartment", "Executive Condominium"))
+save_tbl(fc4$gap, "t7_floor_check_apt_ec")
+
+# Record count behind the EC new-sale median on floors 16+, much smaller than
+# the other cells, so it is reported in the note.
+ec_16_new_n <- ref(fc4$gap$n_new,
+                   fc4$gap$property_type == "Executive Condominium" &
+                   fc4$gap$floor_band == "16+")
+
+f4 <- plot_floor(fc4, ncol = 2)
+ggsave(file.path(OUT_FIG, "f4_floor_check_apt_ec.png"), f4,
+       width = 6.8, height = 3.4, dpi = 300)
+f4
+```
+
+Note: OCR apartments and Executive Condominiums with known floor bands. Labels
+show the new-sale minus resale median psf within each floor band. EC new sales
+on floors 16+ have only `r fmt_n(ec_16_new_n)` price records, so that gap is
+less reliable than the others.
